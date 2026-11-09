@@ -1,3 +1,4 @@
 gradio>=5.50,<7
 openai>=1.40
 python-dotenv>=1.0
+numpy>=1.24

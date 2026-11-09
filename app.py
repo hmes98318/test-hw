@@ -13,6 +13,7 @@ import sqlite3
 from pathlib import Path
 
 import gradio as gr
+import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -32,6 +33,12 @@ client = OpenAI(
     timeout=60.0,
 )
 CHAT_MODEL = os.getenv("MODEL_NAME")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL_NAME")
+embed_client = OpenAI(
+    api_key=os.getenv("EMBEDDING_API_KEY") or os.getenv("API_KEY"),
+    base_url=os.getenv("EMBEDDING_API_URL") or os.getenv("LLM_API_URL"),
+    timeout=60.0,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +118,13 @@ def search_rooms(keyword: str) -> dict:
         "四": 4, "六": 6, "八": 8,
     }.items() if word in keyword.lower()), None)
     like = f"%{keyword}%"
-    if capacity is not None:
+    exact = cursor.execute(
+        """SELECT name, name_zh, room_type, capacity, price_per_night, available, features
+           FROM rooms WHERE name = ? OR name_zh = ?""", (keyword, keyword),
+    ).fetchall()
+    if exact:
+        rows = exact
+    elif capacity is not None:
         # 依人數查詢時，不應誤把八人房特色中的「四張床」當作四人房。
         rows = cursor.execute(
             """SELECT name, name_zh, room_type, capacity, price_per_night, available, features
@@ -173,13 +186,64 @@ def calculate_stay(room_name: str, nights: int) -> dict:
     }
 
 
+# 以標題切分政策。索引只在第一次查詢時建立；修改文件後重新啟動程式。
+RULES_PATH = HERE / "guesthouse_rules.txt"
+MIN_SCORE = 0.53  # 依本專案的少量中英文測試調整；換模型或文件需重新評估
+_rules_index = None
+
+
+def embed(texts: list[str]) -> np.ndarray:
+    if not EMBEDDING_MODEL:
+        raise ValueError("請在 .env 設定 EMBEDDING_MODEL_NAME。")
+    response = embed_client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    vectors = np.asarray([item.embedding for item in response.data], dtype=np.float32)
+    if vectors.ndim != 2 or len(vectors) != len(texts) or not np.isfinite(vectors).all():
+        raise ValueError("Embedding 回傳的向量格式不正確。")
+    return vectors
+
+
+def load_rules_index():
+    global _rules_index
+    if _rules_index is None:
+        text = RULES_PATH.read_text(encoding="utf-8")
+        chunks = []
+        for part in re.split(r"(?m)^## ", text)[1:]:
+            title, _, body = part.partition("\n")
+            if title.strip() and body.strip():
+                chunks.append({"title": title.strip(), "text": body.strip()})
+        if not chunks:
+            raise ValueError("民宿規定文件沒有可搜尋的段落。")
+        vectors = embed([f"{chunk['title']}\n{chunk['text']}" for chunk in chunks])
+        _rules_index = (chunks, vectors)
+    return _rules_index
+
+
+def search_guesthouse_rules(question: str) -> dict:
+    """以語意檢索民宿政策，回傳相關原文與標題，不直接產生答案。"""
+    if not question.strip():
+        return {"found": False, "note": "請提供要查詢的民宿規定。"}
+    chunks, vectors = load_rules_index()
+    query = embed([question])[0]
+    norms = np.linalg.norm(vectors, axis=1) * np.linalg.norm(query)
+    if np.any(norms == 0):
+        raise ValueError("Embedding 回傳零向量，無法計算相似度。")
+    scores = vectors @ query / norms
+    best = [i for i in np.argsort(scores)[::-1][:2] if scores[i] >= MIN_SCORE]
+    if not best:
+        return {"found": False, "note": "民宿規定中找不到相關內容。"}
+    return {"found": True, "chunks": [
+        {"title": chunks[i]["title"], "text": chunks[i]["text"],
+         "score": round(float(scores[i]), 3)} for i in best
+    ]}
+
+
 def transfer_to_human() -> dict:
     """回傳真人客服聯絡資訊，供客訴、改訂房或資料不足的情況使用。"""
     return {
         "phone": "07-555-0188",
         "service_hours": "每日 08:00–21:00",
         "email": "hello@seasidehaven.example",
-        "note": "民宿人員可協助處理客訴、訂房異動、特殊例外與資料未涵蓋的民宿問題。",
+        "note": "民宿人員可協助處理客訴、訂房異動、特殊例外與資料未涵蓋的民宿問題。此工具只提供聯絡方式；不可說已轉接、將轉接或已完成任何訂房異動。",
     }
 
 
@@ -187,20 +251,21 @@ TOOL_FUNCTIONS = {
     "get_guesthouse_info": get_guesthouse_info,
     "search_rooms": search_rooms,
     "calculate_stay": calculate_stay,
+    "search_guesthouse_rules": search_guesthouse_rules,
     "transfer_to_human": transfer_to_human,
 }
 
 TOOL_SPECS = [
     {"type": "function", "function": {
         "name": "get_guesthouse_info",
-        "description": "查詢民宿的一項固定資訊，例如入住、退房、地址、電話、停車、早餐、付款、寵物、寄放行李、取消政策或 Wi-Fi。",
+        "description": "查詢民宿固定資訊：入住與退房時間、地址、電話、停車、早餐、付款方式與訂金、寄放行李或 Wi-Fi。寵物和取消退款規定請查 search_guesthouse_rules。",
         "parameters": {"type": "object", "properties": {
             "topic": {"type": "string", "enum": INFO_TOPICS}
         }, "required": ["topic"]},
     }},
     {"type": "function", "function": {
         "name": "search_rooms",
-        "description": "搜尋房型，回傳每晚房價、容納人數、特色與可用狀態。適用於房型、價格、景觀、寵物、無障礙或容納人數等問題。請使用簡短關鍵字，例如「double」、「family」、「sea view」、「港灣」或「4」。",
+        "description": "搜尋房型，回傳每晚房價、容納人數、特色與可用狀態。適用於房型、價格、景觀、無障礙或容納人數等問題。請使用簡短關鍵字，例如「double」、「family」、「sea view」、「港灣」或「4」。寵物入住政策請使用 search_guesthouse_rules。",
         "parameters": {"type": "object", "properties": {
             "keyword": {"type": "string"}
         }, "required": ["keyword"]},
@@ -214,6 +279,13 @@ TOOL_SPECS = [
         }, "required": ["room_name", "nights"]},
     }},
     {"type": "function", "function": {
+        "name": "search_guesthouse_rules",
+        "description": "檢索民宿政策文件，回答寵物入住、清潔費、取消與退款條件。傳入完整問題；回答需根據回傳的段落並標明標題。",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "使用者關於民宿政策的完整問題。"}
+        }, "required": ["question"]},
+    }},
+    {"type": "function", "function": {
         "name": "transfer_to_human",
         "description": "用於客訴、要求真人服務、訂房異動、特殊例外，或其他工具無法回答的民宿問題。不可用於與民宿無關的話題。",
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -221,19 +293,31 @@ TOOL_SPECS = [
 ]
 
 
-SYSTEM_PROMPT = """
-你是「海岸小屋民宿」的線上客服 Agent；這是一間虛構的高雄民宿。
-所有價格均為新臺幣，格式必須寫成 NT$。
+OPENING_LINE = (
+    "歡迎來到海岸小屋民宿。您可以詢問房型、價格、入住或民宿服務。\n\n"
+    "Welcome to Seaside Haven Guesthouse. Ask me about rooms, prices, check-in, "
+    "or guesthouse services."
+)
 
-規則
-1. 只能根據工具回傳的結果回答。不可憑記憶回答，也不可虛構事實、房型、價格或政策。
-2. 工具找不到答案時，要明確說明；若真人客服可以協助，使用 transfer_to_human。
-3. 只討論這間民宿。天氣、作業、程式或一般知識等無關要求，要禮貌婉拒。
-4. 答覆應有幫助且精簡，不超過三句；依程式指定的語言回答。
-5. 入住、早餐、停車、付款、寵物、取消或 Wi-Fi 等民宿固定資訊 → get_guesthouse_info。
-6. 房型、特色、容納人數、可用狀態或每晚價格 → search_rooms。
-7. 任何住宿總價 → calculate_stay。絕不可自行計算金額；房名不清楚時先搜尋。
-8. 客訴、訂房異動、特殊需求、要求真人服務，或資料未涵蓋的民宿問題 → transfer_to_human。
+SYSTEM_PROMPT = f"""
+角色與目標
+你是「海岸小屋民宿」的線上客服 Agent；這是一間虛構的高雄民宿。你的工作是根據民宿資料協助旅客查詢。
+
+服務範圍
+只處理這間民宿的房型、價格、固定資訊及住宿政策。房型的可用狀態只是範例資料，並非指定日期的即時空房，不能保證訂得到房。從未實際建立、修改或取消訂單，不可聲稱完成。
+
+互動規則
+所有價格均為新臺幣，格式必須寫成 NT$。只能根據工具回傳的結果回答，不可憑記憶回答，也不可虛構事實、房型、價格或政策。答覆應有幫助且精簡，不超過三句；依程式指定的語言回答。
+入住時間、早餐、停車、付款、寄放行李或 Wi-Fi 等固定資訊 → get_guesthouse_info。
+房型、特色、容納人數、可用狀態或每晚價格 → search_rooms。
+任何住宿總價 → calculate_stay。絕不可自行計算金額；房名不清楚時先搜尋。
+寵物入住及清潔費、取消和退款規定 → search_guesthouse_rules；只能依查到的原文回答，並在回答末尾標明「來源：段落標題」。相似度高不代表段落一定有答案；原文沒有回答的部分必須明說不知道。
+
+拒答與特殊情況
+工具找不到答案時，要明確說明；若真人客服可以協助，使用 transfer_to_human。客訴、訂房異動、特殊需求、要求真人服務，或資料未涵蓋的民宿問題 → transfer_to_human。此工具只提供聯絡方式，絕不可說已轉接、將轉接，或已經完成處理。天氣、作業、程式或一般知識等範圍外問題，固定回答「抱歉，我只能協助海岸小屋民宿的相關問題。」資料沒有答案時，固定回答「抱歉，我找不到相關資料，請聯絡民宿櫃檯。」英文提問時翻譯這些回覆。
+
+開場白
+介面在新對話的第一則訊息顯示以下內容：{OPENING_LINE}
 """.strip()
 
 MAX_STEPS = 6
@@ -310,21 +394,19 @@ def run_agent(chat_history: list[dict]) -> tuple[str, list[dict]]:
 # ---------------------------------------------------------------------------
 # 4. Gradio 聊天介面與可見的工具軌跡
 # ---------------------------------------------------------------------------
-GREETING = (
-    "歡迎來到海岸小屋民宿。您可以詢問房型、價格、入住或民宿服務。\n\n"
-    "Welcome to Seaside Haven Guesthouse. Ask me about rooms, prices, check-in, "
-    "or guesthouse services."
-)
+GREETING = OPENING_LINE
 EMPTY_TRACE = "### 使用的工具\n\n（尚未呼叫工具）"
 
 SAMPLE_QUESTIONS_EN = [
     "What time can I check in?",
+    "Can I cancel my booking for a refund?",
     "Do you have a pet-friendly room?",
     "How much is the Seaside Suite for three nights?",
     "I need to change my reservation.",
 ]
 SAMPLE_QUESTIONS_ZH = [
     "請問入住時間是幾點？",
+    "取消訂房可以退款嗎？",
     "有可以帶寵物的房間嗎？",
     "海景套房住三晚多少錢？",
     "我想更改訂房。",
@@ -403,7 +485,7 @@ def find_available_port() -> int:
 with gr.Blocks(title="海岸小屋民宿客服 Agent") as demo:
     gr.Markdown(
         "## 海岸小屋民宿 — 客服 Agent\n"
-        "房型與民宿資訊都來自本機資料庫；右側會顯示工具呼叫軌跡。"
+        "房型與民宿資訊來自資料庫；住宿政策由文件檢索。右側顯示工具呼叫與檢索結果。"
     )
     with gr.Row():
         with gr.Column(scale=3):
